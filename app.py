@@ -12,6 +12,7 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from waitress import serve
 
 # Import custom modules
 from bulk_parser import parse_html_table
@@ -77,27 +78,34 @@ def generate_password(first: str) -> str:
 def calculate_expiry(duration: str) -> str:
     """
     Calculate expiration date based on duration string.
-    Supports "X month(s)" and "X year(s)".
+    Supports "X month(s)", "X year(s)", and numeric-only strings (defaulting to months).
     """
-    if not duration or str(duration).lower() == "permanent":
+    if not duration or str(duration).lower() in ["permanent", "none", "0"]:
         return "never"
     
     now = datetime.now()
-    duration_lower = str(duration).lower()
+    duration_str = str(duration).strip().lower()
     
-    # Try to find a number and a unit (month/year)
-    match = re.search(r"(\d+)\s*(month|year)", duration_lower)
+    # Case 1: Pure numeric string (e.g., "3") -> Assume months
+    if duration_str.isdigit():
+        val = int(duration_str)
+        expiry = now + timedelta(days=val * 30)
+        return expiry.strftime("%Y-%m-%d")
+
+    # Case 2: Standard "X months" or "X years"
+    match = re.search(r"(\d+)\s*(month|year|day)", duration_str)
     if not match:
         return "never"
         
     val = int(match.group(1))
     unit = match.group(2)
     
-    if unit == "year":
+    if "year" in unit:
         expiry = now + timedelta(days=val * 365)
-    else: # month
-        # Approximation: 30 days per month
+    elif "month" in unit:
         expiry = now + timedelta(days=val * 30)
+    else: # day
+        expiry = now + timedelta(days=val)
         
     return expiry.strftime("%Y-%m-%d")
 
@@ -198,7 +206,7 @@ def create_user():
     shared_reason = payload.get("Reason for Access")
     shared_vendor = payload.get("vendor name")
     shared_duration = payload.get("AD Account Duration")
-    shared_email_required = payload.get("Outlook Email Required")
+    shared_email_required = payload.get("Outlook Email required ")
 
     # Groups: split by semicolon, skip Domain Users
     shared_groups = [g.strip() for g in shared_groups_raw.split(";") if g.strip() and g.strip().lower() != "domain users"]
@@ -230,7 +238,9 @@ def create_user():
         })
 
     # Calculate global expiry date
+    logger.info(f"Calculating expiry for duration string: '{shared_duration}'")
     account_expires = calculate_expiry(shared_duration)
+    logger.info(f"Target expiry date determined: {account_expires}")
 
     for user in raw_users:
         first = user["first_name"]
@@ -240,17 +250,21 @@ def create_user():
         username = generate_username(first, last)
         
         # Logic 4: Conditional Email
-        if shared_email_required == "Yes":
+        # Ensure case-insensitive check for "Yes" or "YES"
+        if str(shared_email_required).strip().lower() == "yes":
             email = f"{username}@{PARTNER_EMAIL_DOMAIN}"
         else:
             email = user.get("email_raw")
+            # If still no email, use a fallback to avoid script error
+            if not email:
+                email = f"{username}@{PARTNER_EMAIL_DOMAIN}"
 
         # Logic 5: Password is now auto-generated
         password = generate_password(first)
 
         # Logic 6: DisplayName built from Vendor Name
         # Using dash instead of pipe as | is disallowed in AD Name attribute
-        display_name = f"{first} {last} - Partner|{shared_vendor}"
+        display_name = f"{first} {last} - Partner - {shared_vendor}"
 
         # Logic 1 & 7 & 8 & 9: Merge shared fields
         user_data = {
@@ -338,4 +352,4 @@ def create_user():
 
 if __name__ == "__main__":
     logger.info(f"Starting AD Provisioning Automation on {FLASK_HOST}:{FLASK_PORT}")
-    app.run(host=FLASK_HOST, port=FLASK_PORT)
+    serve(app, host=FLASK_HOST, port=FLASK_PORT, threads=4)
