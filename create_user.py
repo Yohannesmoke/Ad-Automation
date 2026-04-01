@@ -27,7 +27,7 @@ def run_remote_ad_script(user_data: dict) -> dict:
     # Prepare parameters for PowerShell
     groups_str = ",".join(user_data.get("groups", []))
     
-    # Map Boolean text to PowerShell booleans (ChangePassword)
+    # Map Boolean text to PowerShell booleans
     change_pw = "$true" if str(user_data.get("change_password")).upper() == "TRUE" else "$false"
 
     # Escape all text values
@@ -42,7 +42,6 @@ def run_remote_ad_script(user_data: dict) -> dict:
     mgr    = escape_ps_val(user_data.get('manager'))
     groups = escape_ps_val(groups_str)
     ou     = escape_ps_val(user_data.get('ou'))
-    expiry = escape_ps_val(user_data.get('account_expires'))
 
     cmd = [
         "powershell.exe",
@@ -62,8 +61,7 @@ def run_remote_ad_script(user_data: dict) -> dict:
         f"-ChangePassword {change_pw} "
         f"-Manager '{mgr}' "
         f"-Groups '{groups}' "
-        f"-OU '{ou}' "
-        f"-AccountExpirationDate '{expiry}'"
+        f"-OU '{ou}'"
     ]
 
     try:

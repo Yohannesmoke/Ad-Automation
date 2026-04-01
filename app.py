@@ -1,18 +1,10 @@
 import os
 import json
 import logging
-import re
-import secrets
-import string
-import ssl
-from urllib.request import Request, urlopen
-from urllib.parse import urlencode
-from urllib.error import HTTPError, URLError
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from waitress import serve
 
 # Import custom modules
 from bulk_parser import parse_html_table
@@ -25,12 +17,6 @@ load_dotenv()
 FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
 FLASK_PORT = int(os.getenv("FLASK_PORT", 5000))
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN")
-PARTNER_EMAIL_DOMAIN = os.getenv("PARTNER_EMAIL_DOMAIN", "partnersafaricom.et")
-
-# SDP Configuration
-SDP_API_KEY = os.getenv("SDP_API_KEY")
-SDP_BASE_URL = os.getenv("SDP_BASE_URL")
-SDP_LOG_FIELD = os.getenv("SDP_LOG_FIELD", "udf_mline_908")
 
 # Logging Configuration
 LOG_DIR = "logs"
@@ -59,110 +45,6 @@ def validate_token(req):
     token = req.headers.get("X-Webhook-Token")
     return token == WEBHOOK_SECRET_TOKEN
 
-def generate_username(first: str, last: str) -> str:
-    """Generate username as firstname.lastname (lowercase, alphanumeric only)."""
-    f = re.sub(r"[^a-z0-9]", "", first.lower())
-    l = re.sub(r"[^a-z0-9]", "", last.lower())
-    return f"{f}.{l}"
-
-def generate_password(first: str) -> str:
-    """
-    Generate password as: Firstname + 4 random digits + @
-    Must have uppercase, lowercase, number, special char.
-    Firstname starts with uppercase, so we satisfy that.
-    """
-    # Use a truly random 16-character password to satisfy strict AD policies
-    alphabet = string.ascii_letters + string.digits + "!@#$%"
-    return "".join(secrets.choice(alphabet) for _ in range(16))
-
-def calculate_expiry(duration: str) -> str:
-    """
-    Calculate expiration date based on duration string.
-    Supports "X month(s)", "X year(s)", and numeric-only strings (defaulting to months).
-    """
-    if not duration or str(duration).lower() in ["permanent", "none", "0"]:
-        return "never"
-    
-    now = datetime.now()
-    duration_str = str(duration).strip().lower()
-    
-    # Case 1: Pure numeric string (e.g., "3") -> Assume months
-    if duration_str.isdigit():
-        val = int(duration_str)
-        expiry = now + timedelta(days=val * 30)
-        return expiry.strftime("%Y-%m-%d")
-
-    # Case 2: Standard "X months" or "X years"
-    match = re.search(r"(\d+)\s*(month|year|day)", duration_str)
-    if not match:
-        return "never"
-        
-    val = int(match.group(1))
-    unit = match.group(2)
-    
-    if "year" in unit:
-        expiry = now + timedelta(days=val * 365)
-    elif "month" in unit:
-        expiry = now + timedelta(days=val * 30)
-    else: # day
-        expiry = now + timedelta(days=val)
-        
-    return expiry.strftime("%Y-%m-%d")
-
-def update_sdp_ticket(request_id, message):
-    """
-    Update the SDP ticket with provisioning logs/credentials.
-    Uses SDP API v3.
-    """
-    if not SDP_API_KEY or not SDP_BASE_URL or not request_id:
-        logger.warning("SDP integration skipped: Missing configuration or request_id")
-        return False
-
-    url = f"{SDP_BASE_URL}/{request_id}"
-    headers = {
-        "Accept": "application/vnd.manageengine.sdp.v3+json",
-        "authtoken": SDP_API_KEY,
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    
-    # Payload for updating
-    input_data = {
-        "request": {
-            "udf_fields": {
-                SDP_LOG_FIELD: message
-            }
-        }
-    }
-
-    # Encode as per user example
-    data = urlencode({"input_data": json.dumps(input_data)}).encode()
-
-    try:
-        logger.info(f"Attempting to update SDP ticket {request_id} via urllib...")
-        
-        # Create unverified context for localhost HTTPS
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        httprequest = Request(url, headers=headers, data=data, method="PUT")
-        
-        with urlopen(httprequest, context=ctx, timeout=10) as response:
-            resp_body = response.read().decode()
-            logger.info(f"Successfully updated SDP ticket {request_id}. Response: {resp_body}")
-            return True
-            
-    except HTTPError as e:
-        resp_err = e.read().decode()
-        logger.error(f"SDP HTTP Error {e.code}: {resp_err}")
-        return False
-    except URLError as e:
-        logger.error(f"SDP URL Error: {str(e.reason)}")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error updating SDP: {str(e)}")
-        return False
-
 @app.route("/health", methods=["GET"])
 def health():
     """Confirm app is running."""
@@ -179,7 +61,7 @@ def debug():
 @app.route("/webhook/create-user", methods=["POST"])
 def create_user():
     """Main endpoint to handle AD user creation requests."""
-    logger.info(f"Incoming webhook request from {request.remote_addr}")
+    logger.info(f"Incoming webhook request from {request.remote_addr} (Headers: {dict(request.headers)})")
 
     # 1. Validate Token
     if not validate_token(request):
@@ -190,32 +72,15 @@ def create_user():
     payload = request.get_json(silent=True)
     if not payload or "description" not in payload:
         logger.error("Invalid payload: Missing 'description' field")
-        return jsonify({"error": "Invalid payload structure"}), 400
-
-    # Extract ID for SDP update
-    # The new payload uses "ticket id", but we'll fallback to other common names
-    request_id = payload.get("ticket id") or payload.get("WORKORDERID") or payload.get("request_id") or payload.get("id")
-    logger.info(f"SDP Ticket ID detected: {request_id}")
+        return jsonify({"error": "No table found in description"}), 400
 
     html_content = payload.get("description", "")
-    
-    # Extract Shared Fields
-    shared_ou = payload.get("ou")
-    shared_groups_raw = payload.get("Groups", "")
-    shared_manager = payload.get("Manager")
-    shared_reason = payload.get("Reason for Access")
-    shared_vendor = payload.get("vendor name")
-    shared_duration = payload.get("AD Account Duration")
-    shared_email_required = payload.get("Outlook Email required ")
-
-    # Groups: split by semicolon, skip Domain Users
-    shared_groups = [g.strip() for g in shared_groups_raw.split(";") if g.strip() and g.strip().lower() != "domain users"]
-
-    logger.info(f"Webhook received. Processing batch for vendor: {shared_vendor}")
+    logger.info(f"Webhook received from {request.remote_addr}. Parsing HTML table...")
 
     # 3. Extract Users from HTML
+    # Note: Parser now automatically generates usernames/passwords if missing
     try:
-        raw_users, skipped_rows = parse_html_table(html_content)
+        users, skipped = parse_html_table(html_content)
     except ValueError as e:
         logger.error(f"Parsing error: {str(e)}")
         return jsonify({"error": str(e)}), 400
@@ -223,133 +88,71 @@ def create_user():
         logger.exception("Unexpected error during parsing")
         return jsonify({"error": "Internal parsing error"}), 500
 
+    if not users and not skipped:
+        logger.info("No user data found in the HTML table.")
+        return jsonify({"error": "No table found in description"}), 400
+
     # 4. Process Users
+    total_users = len(users) + len(skipped)
     results = []
-    succeeded = 0
-    failed = 0
-    skipped = len(skipped_rows)
     
     # Add skipped users to results
-    for skip in skipped_rows:
+    for skip in skipped:
         results.append({
-            "username": skip.get("username", "unknown"),
+            "username": skip.get("username"),
             "success": False,
             "message": skip.get("reason")
         })
 
-    # Calculate global expiry date
-    logger.info(f"Calculating expiry for duration string: '{shared_duration}'")
-    account_expires = calculate_expiry(shared_duration)
-    logger.info(f"Target expiry date determined: {account_expires}")
+    succeeded = 0
+    failed = len(skipped)
 
-    for user in raw_users:
-        first = user["first_name"]
-        last = user["last_name"]
-        
-        # Logic 3: UserLogonName is now auto-generated
-        username = generate_username(first, last)
-        
-        # Logic 4: Conditional Email
-        # Ensure case-insensitive check for "Yes" or "YES"
-        if str(shared_email_required).strip().lower() == "yes":
-            email = f"{username}@{PARTNER_EMAIL_DOMAIN}"
-        else:
-            email = user.get("email_raw")
-            # If still no email, use a fallback to avoid script error
-            if not email:
-                email = f"{username}@{PARTNER_EMAIL_DOMAIN}"
-
-        # Logic 5: Password is now auto-generated
-        password = generate_password(first)
-
-        # Logic 6: DisplayName built from Vendor Name
-        # Using dash instead of pipe as | is disallowed in AD Name attribute
-        display_name = f"{first} {last} - Partner - {shared_vendor}"
-
-        # Logic 1 & 7 & 8 & 9: Merge shared fields
-        user_data = {
-            "first_name": first,
-            "last_name": last,
-            "display_name": display_name,
-            "description": shared_reason,
-            "phone": user.get("phone"),
-            "email": email,
-            "username": username,
-            "password": password,
-            "manager": shared_manager,
-            "groups": shared_groups,
-            "ou": shared_ou,
-            "account_expires": account_expires,
-            "change_password": "TRUE" # Default requirement
-        }
-
+    for user in users:
+        username = user.get("username")
+        password = user.get("password")
         logger.info(f"Attempting to create user: {username}")
         
         try:
             # Call WinRM script
-            res = run_remote_ad_script(user_data)
+            res = run_remote_ad_script(user)
             
             if res.get("success"):
                 succeeded += 1
-                logger.info(f"User created successfully: {username}")
-                results.append({
-                    "username": username,
-                    "full_name": f"{first} {last}",
-                    "email": email,
-                    "generated_password": password,
-                    "success": True,
-                    "message": "User created successfully",
-                    "groups": shared_groups,
-                    "ou": shared_ou,
-                    "account_expires": account_expires
-                })
+                logger.info(f"User created successfully: {username} | Password: {password}")
             else:
                 failed += 1
                 logger.error(f"Failed to create user {username}: {res.get('message')}")
-                results.append({
-                    "username": username,
-                    "success": False,
-                    "message": res.get("message")
-                })
+            
+            # Add password to report if it was generated
+            report_data = {
+                "username": username,
+                "password": password, 
+                "success": res.get("success"),
+                "message": res.get("message")
+            }
+            results.append(report_data)
             
         except Exception as e:
             failed += 1
-            msg = str(e)
+            msg = f"Unexpected error during user creation: {str(e)}"
             logger.error(f"Error for {username}: {msg}")
             results.append({
                 "username": username,
                 "success": False,
-                "message": f"Unexpected error: {msg}"
+                "message": msg
             })
 
     # 5. Return Report
     report = {
-        "total": len(raw_users) + skipped,
+        "total": total_users,
         "succeeded": succeeded,
         "failed": failed,
-        "skipped": skipped,
         "results": results
     }
     
-    logger.info(f"Batch processed: {succeeded} succeeded, {failed} failed, {skipped} skipped")
-
-    # 6. Optional: Update SDP Ticket with Results
-    if request_id:
-        sdp_lines = [f"AD Provisioning Batch Results - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "----------------------------------------"]
-        for res in results:
-            status = "SUCCESS" if res.get("success") else "FAILED"
-            line = f"[{status}] User: {res.get('username')}"
-            if res.get("success"):
-                line += f" | Pass: {res.get('generated_password')}"
-            else:
-                line += f" | Error: {res.get('message')}"
-            sdp_lines.append(line)
-        
-        full_message = "\n".join(sdp_lines)
-        update_sdp_ticket(request_id, full_message)
-
+    logger.info(f"Batch processed: {succeeded} succeeded, {failed} failed out of {total_users}")
     return jsonify(report), 200
 
 if __name__ == "__main__":
     logger.info(f"Starting AD Provisioning Automation on {FLASK_HOST}:{FLASK_PORT}")
-    serve(app, host=FLASK_HOST, port=FLASK_PORT, threads=4)
+    app.run(host=FLASK_HOST, port=FLASK_PORT)

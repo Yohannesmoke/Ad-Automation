@@ -22,18 +22,21 @@ logger = logging.getLogger(__name__)
 COLUMN_MAP = {
     "first_name":      ["firstname", "first name"],
     "last_name":       ["lastname", "last name"],
+    "display_name":    ["displayname", "display name"],
+    "description":     ["description"],
     "phone":           ["telephonenumber", "telephone number", "phone", "mobile"],
     "email":           ["email", "e-mail", "mail"],
+    "manager":         ["manager"],
+    "groups":          ["groups", "user groups", "group"],
+    "ou":              ["ou", "organizational unit", "path"],
 }
 
 
 def _cell_text(cell) -> str:
     """
     Extract clean text from a <td>/<th>, handling nested tags, <br/>, &nbsp;,
-    and any child tables (SDP wraps values in an inner <table> sometimes).
+    and any child tables (SDP wraps OU values in an inner <table> sometimes).
     """
-    if not cell:
-        return ""
     # get_text with separator so adjacent block elements don't merge words
     raw = cell.get_text(separator=" ", strip=True)
     raw = raw.replace("\xa0", " ")          # &nbsp;
@@ -44,7 +47,8 @@ def _cell_text(cell) -> str:
 def _detect_columns(header_cells: list) -> dict:
     """
     Build {internal_key: column_index} by matching each header cell's text
-    against COLUMN_MAP patterns. 
+    against COLUMN_MAP patterns. Uses exact matching first to avoid 
+    substring collisions (e.g., 'ou' matching inside 'groups').
     """
     mapping = {}
     used_indices = set()
@@ -52,9 +56,7 @@ def _detect_columns(header_cells: list) -> dict:
     # Pre-normalise all headers
     headers = []
     for cell in header_cells:
-        h_text = _cell_text(cell)
-        h_norm = h_text.lower().replace(" ", "").replace("_", "")
-        headers.append(h_norm)
+        headers.append(_cell_text(cell).lower().replace(" ", "").replace("_", ""))
 
     # Pass 1: Exact matches
     for key, patterns in COLUMN_MAP.items():
@@ -91,11 +93,30 @@ def _extract_email(cell) -> str:
     return _cell_text(cell)
 
 
+def generate_username(first: str, last: str) -> str:
+    """Generate username as firstname.lastname (lowercase, alphanumeric only)."""
+    f = re.sub(r"[^a-zA-Z0-9]", "", first).lower()
+    l = re.sub(r"[^a-zA-Z0-9]", "", last).lower()
+    return f"{f}.{l}"
+
+
+def generate_password(length: int = 12) -> str:
+    """Generate a random password satisfying AD complexity requirements."""
+    chars = string.ascii_letters + string.digits + "!@#$%"
+    while True:
+        pw = "".join(secrets.choice(chars) for _ in range(length))
+        if (any(c.islower() for c in pw)
+                and any(c.isupper() for c in pw)
+                and any(c.isdigit() for c in pw)
+                and any(c in "!@#$%" for c in pw)):
+            return pw
+
+
 def parse_html_table(html: str) -> tuple[list[dict], list[dict]]:
     """
     Parse the SDP description HTML and return (users, skipped).
 
-    users   — list of dicts with raw data from the 4-column table
+    users   — list of dicts ready to pass to create_user.py
     skipped — list of {username, reason, row_index} for rows that were skipped
     """
     if not html or not html.strip():
@@ -150,16 +171,16 @@ def parse_html_table(html: str) -> tuple[list[dict], list[dict]]:
 
         first_name = get("first_name")
         last_name  = get("last_name")
-        phone      = get("phone")
         email      = get("email")
+        ou         = get("ou")
 
         # Skip completely empty rows
-        if not first_name and not last_name:
+        if not first_name and not last_name and not email:
             continue
 
-        # Validate required fields for the row itself
+        # Validate required fields
         missing = [f for f, v in [
-            ("FirstName", first_name), ("LastName", last_name)
+            ("FirstName", first_name), ("LastName", last_name), ("OU", ou)
         ] if not v]
 
         if missing:
@@ -172,12 +193,34 @@ def parse_html_table(html: str) -> tuple[list[dict], list[dict]]:
             })
             continue
 
+        # Auto-generate username if absent
+        username = get("username") or generate_username(first_name, last_name)
+
+        # Auto-generate password if absent
+        password = get("password") or generate_password()
+
+        # Normalise ChangePassword
+        cp_raw = get("change_password").upper()
+        change_password = "TRUE" if cp_raw in ("TRUE", "YES", "1", "") else "FALSE"
+
+        # Groups: split by semicolon (SDP table uses ; between group names)
+        raw_groups = get("groups")
+        groups = [g.strip() for g in raw_groups.split(";") if g.strip()]
+
         users.append({
-            "first_name": first_name,
-            "last_name":  last_name,
-            "phone":      phone,
-            "email_raw":  email,
+            "first_name":      first_name,
+            "last_name":       last_name,
+            "display_name":    get("display_name"),
+            "description":     get("description"),
+            "phone":           get("phone"),
+            "email":           email,
+            "manager":         get("manager"),
+            "groups":          groups,
+            "ou":              ou,
+            "username":        username,
+            "password":        password,
+            "change_password": change_password,
         })
-        logger.info("Parsed user row: %s %s", first_name, last_name)
+        logger.info("Parsed user: %s (OU: %s)", username, ou)
 
     return users, skipped

@@ -10,14 +10,13 @@ param(
     [Parameter(Mandatory=$false)][bool]$ChangePassword = $true,
     [Parameter(Mandatory=$false)][string]$Manager,
     [Parameter(Mandatory=$false)][string]$Groups,
-    [Parameter(Mandatory=$true)][string]$OU,
-    [Parameter(Mandatory=$false)][string]$AccountExpirationDate
+    [Parameter(Mandatory=$true)][string]$OU
 )
 
 # Debug Log - Append to a local file to see what was received
 $DebugLog = Join-Path $PSScriptRoot "ad_script_debug.log"
 "--- New Execution (User: $UserLogonName) ---" | Out-File -FilePath $DebugLog -Append
-"Params: FN=$FirstName, LN=$LastName, DN=$DisplayName, Desc=$Description, Phone=$TelephoneNumber, Email=$Email, UN=$UserLogonName, PW=(hidden), Manager=$Manager, Groups=$Groups, OU=$OU, Expiry=$AccountExpirationDate" | Out-File -FilePath $DebugLog -Append
+"Params: FN=$FirstName, LN=$LastName, DN=$DisplayName, Desc=$Description, Phone=$TelephoneNumber, Email=$Email, UN=$UserLogonName, PW=(hidden), Manager=$Manager, Groups=$Groups, OU=$OU" | Out-File -FilePath $DebugLog -Append
 
 # Result scaffold
 $result = [ordered]@{
@@ -30,7 +29,6 @@ $result = [ordered]@{
         LastName  = $LastName
         Email     = $Email
         OU        = $OU
-        AccountExpires = $AccountExpirationDate
     }
 }
 
@@ -43,18 +41,21 @@ try {
     $existing = Get-ADUser -Filter "SamAccountName -eq '$UserLogonName'" -ErrorAction SilentlyContinue
     if ($existing) {
         $result.message = "User already exists in AD"
-        Write-Output ($result | ConvertTo-Json -Compress)
+        Write-Output ($result | ConvertTo-Json -Compress) # NO -Depth here for simplicity
         exit 0
     }
 
     # Resolve Manager
     $managerDN = $null
     if (-not [string]::IsNullOrWhiteSpace($Manager)) {
+        # Try SamAccountName first
         $mgrObj = Get-ADUser -Filter "SamAccountName -eq '$Manager'" -ErrorAction SilentlyContinue
         if (-not $mgrObj) {
+            # Try Name (e.g. "John Doe")
             $mgrObj = Get-ADUser -Filter "Name -eq '$Manager'" -ErrorAction SilentlyContinue
         }
         if (-not $mgrObj) {
+            # Try searching by DisplayName
             $mgrObj = Get-ADUser -Filter "DisplayName -eq '$Manager'" -ErrorAction SilentlyContinue
         }
         
@@ -63,7 +64,6 @@ try {
             $result.details.ManagerFound = "Yes ($($mgrObj.SamAccountName))"
         } else {
             $result.details.ManagerFound = "No (Could not find user '$Manager')"
-            "WARNING: Manager '$Manager' not found. Creating user without manager." | Out-File -FilePath $DebugLog -Append
         }
     }
 
@@ -92,20 +92,8 @@ try {
         $adParams["Manager"] = $managerDN
     }
 
-    # Handle Account Expiration
-    if ($AccountExpirationDate -and $AccountExpirationDate -ne "never") {
-        try {
-            $expiryDate = [DateTime]::ParseExact($AccountExpirationDate, "yyyy-MM-dd", $null)
-            $adParams["AccountExpirationDate"] = $expiryDate
-        } catch {
-            "WARNING: Could not parse AccountExpirationDate '$AccountExpirationDate'. Skipping expiry." | Out-File -FilePath $DebugLog -Append
-        }
-    }
-
     # Execute
     try {
-        "DEBUG: Creating user with parameters:" | Out-File -FilePath $DebugLog -Append
-        $adParams.Keys | ForEach-Object { "$_ = $($adParams[$_])" } | Out-File -FilePath $DebugLog -Append
         New-ADUser @adParams -ErrorAction Stop
     } catch {
         "ERROR creating user: $($_.Exception.Message)" | Out-File -FilePath $DebugLog -Append
